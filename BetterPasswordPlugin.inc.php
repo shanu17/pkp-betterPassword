@@ -46,6 +46,7 @@ class betterPasswordPlugin extends GenericPlugin {
 		if (!Config::getVar('general', 'installed') || defined('RUNNING_UPGRADE')) return true;
 		if ($success && $this->getEnabled()) {
 			// Attach hooks
+			$this->registerDAOs();
 			foreach (array('registrationform::validate', 'changepasswordform::validate', 'loginchangepasswordform::validate') as $hook) {
 				HookRegistry::register($hook, array(&$this, 'checkPassword'));
 			}
@@ -56,6 +57,7 @@ class betterPasswordPlugin extends GenericPlugin {
 				HookRegistry::register('LoadHandler', array($this, 'callbackLoadHandler'));
 			}
 			HookRegistry::register('userdao::getAdditionalFieldNames', array(&$this, 'addUserSettings'));
+			HookRegistry::register('LoadComponentHandler', array($this, 'callbackLoadHandler'));
 		}
 		return $success;
 	}
@@ -160,23 +162,14 @@ class betterPasswordPlugin extends GenericPlugin {
 		if ($this->getSetting(CONTEXT_SITE, 'betterPasswordCheckBlacklist')) {
 			$badPassword = false;
 			$lowerPassword = strtolower($password);
-			foreach ($this->getBlacklists() as $filename) {
-				/* In case of out-of-memory error, break glass
-				$passwordfile = fopen($filename, "r");
-				while (!feof($passwordfile)) {
-					$disallowed = fgets($passwordfile);
-					if ($lowerPassword === $disallowed) {
-						$badPassword = true;
-						break;
-					}
-				}
-				fclose($passwordfile);
-				 */
-				$passwordfile = file_get_contents($filename);
-				if (strpos($passwordfile, $lowerPassword) !== false) {
-					$badPassword = true;
-					break;
-				}
+			$shaPass = sha1($lowerPassword);
+			$passwordHash = substr($shaPass,0,2);
+			$blacklist = $this->generateBlacklist();
+			if ($blacklist) {
+				$cache = CacheManager::getManager()->getCache('badPasswords', $passwordHash, array($this, '_PasswordCacheMiss'));
+				$badPassword = $cache->get($shaPass);
+			} else {
+				$form->addError($errorField, __('plugins.generic.betterPassword.validation.betterPasswordUnexpectedError'));
 			}
 			if ($badPassword) {
 				$form->addError($errorField, __('plugins.generic.betterPassword.validation.betterPasswordCheckBlacklist'));
@@ -208,15 +201,95 @@ class betterPasswordPlugin extends GenericPlugin {
 			}
 		}
 	}
-
+	/**
+	 * Check for newly added blacklists. If ran the first time creates the list of blacklists
+	 * @return boolean false if updating blacklist failed, true if updated the blacklist
+	 */	
+	function generateBlacklist() {
+		$prevBlacklist = $this->getSetting(CONTEXT_SITE, 'betterPasswordBlacklistFiles');
+		$updateBlacklist = false;
+		$newBlacklist = array();
+		foreach ($this->getBlacklists() as $filename) {
+			$newBlacklist[$filename] = sha1_file($filename);
+		}
+		if (is_null($prevBlacklist) || $prevBlacklist != $newBlacklist) {
+			$updateTempFile = $this->handleTempFile();
+			if ($updateTempFile) {
+				$updateBlacklist = $this->updateSetting(CONTEXT_SITE, 'betterPasswordBlacklistFiles', $newBlacklist);
+			}
+		} else {
+			$updateBlacklist = true;
+		}
+		return (boolean) $updateBlacklist;
+	}
+        
+	/**
+	 * Creates a temporary file to aggregate all the passwords from the blacklist files if the temporary file doesn't exist
+	 * @return string|null The file path for the temporary file
+	 */
+	function getTempFile() {
+		import('lib.pkp.classes.file.PrivateFileManager');
+		$fileMgr = new PrivateFileManager();
+		$tempFileDir = realpath($fileMgr->getBasePath()) . DIRECTORY_SEPARATOR . 'betterPassword';
+		if (!$fileMgr->fileExists($tempFileDir, 'dir')) {
+			$success = $fileMgr->mkdirtree($tempFileDir);
+			if (!$success) {
+				error_log('ERROR: Unable to create directory' . $tempFileDir);// Files directory wrong configuration?
+				return null;
+			}
+		}
+		if(!file_exists($tempFileDir . DIRECTORY_SEPARATOR . 'tempPassFile')) {
+			touch($tempFileDir . DIRECTORY_SEPARATOR . 'tempPassFile');
+		}
+		return $tempFileDir . DIRECTORY_SEPARATOR . 'tempPassFile';
+	}
+        
+	/**
+	 * Handles the temporary file with the data of password blacklists.
+	 * @return boolean True if operations done to the temp file succeed  
+	 */
+	function handleTempFile() {
+		$siteDao = DAORegistry::getDAO('SiteDAO');
+		$site = $siteDao->getSite();
+		$minLengthPass = $site->getMinPasswordLength();
+		$tempFilePath = $this->getTempFile();
+		$fpTemp = fopen($tempFilePath, 'w');
+		foreach ($this->getBlacklists() as $filename) {
+			$fpPass = fopen($filename, "r");
+			if (flock($fpTemp, LOCK_EX)) {
+				while (!feof($fpPass)) {
+					$passwordLine = fgets($fpPass);
+					if (strlen($passwordLine) >= $minLengthPass) {
+						fwrite($fpTemp, $passwordLine);
+					}
+				}
+				flock($fpTemp, LOCK_UN);
+			} else {
+				error_log('ERROR: Could not lock file' . $tempFilePath . 'to write contents');
+				return false;
+			}
+			fclose($fpPass);
+		}
+		fclose($fpTemp);
+		$flushCache = CacheManager::getManager()->flush('badPasswords');
+		return true;
+	}
+        
 	/**
 	 * Get the filename(s) of password blacklists.
 	 * @return array filename strings
 	 */
 	function getBlacklists() {
-		return array(
-			$this->getPluginPath() . DIRECTORY_SEPARATOR . 'badPasswords' . DIRECTORY_SEPARATOR . 'badPasswords.txt',
-		);
+		import('lib.pkp.classes.file.PrivateFileManager');
+		$privateFileManager = new PrivateFileManager();
+		$userBlacklists = $this->getSetting(CONTEXT_SITE, 'betterPasswordUserBlacklistFiles');
+		$userBlacklistsFilenames = array_keys($userBlacklists);
+		foreach ($userBlacklistsFilenames as $f) {
+			$userBlacklistsFilepath[] = $privateFileManager->getBasePath() . DIRECTORY_SEPARATOR . 'betterPassword' . DIRECTORY_SEPARATOR . 'blacklists' . DIRECTORY_SEPARATOR . $f;
+		}
+		$pluginBlacklistsFilenames = array ($this->getPluginPath() . DIRECTORY_SEPARATOR . 'badPasswords' . DIRECTORY_SEPARATOR . 'badPasswords.txt', );
+		$blacklistFilenames = array_merge($userBlacklistsFilepath, $pluginBlacklistsFilenames);
+		return $blacklistFilenames;
 	}
 
 	/*
@@ -229,21 +302,17 @@ class betterPasswordPlugin extends GenericPlugin {
 		if ($template === 'frontend/pages/userLogin.tpl') {
 			if ($templateMgr->getTemplateVars('error') === 'user.login.loginError') {
 				$username = $templateMgr->getTemplateVars('username');
-				$userDao = DAORegistry::getDAO('UserDAO');
-				$user = $userDao->getByUsername($username);
+				$badpwFailedLoginsDao = DAORegistry::getDAO('BadpwFailedLoginsDAO');
+				$user = $badpwFailedLoginsDao->getByUsername($username);
 				if (isset($user)) {
-					$count = $user->getData($this->getName()."::badPasswordCount");
-					$time = $user->getData($this->getName()."::badPasswordTime");
+					$count = $user->getCount();
+					$time = $user->getFailedTime();
 					// expire old bad password attempts
 					if (($count || $time) && $time < time() - $this->getSetting(CONTEXT_SITE, 'betterPasswordLockExpires')) {
-						$count = 0;
+						$badpwFailedLoginsDao->resetCount($user);
 					}
-					// update the count and time to represent this failed attempt
-					$count++;
-					$time = time();
-					$user->setData($this->getName()."::badPasswordCount", $count);
-					$user->setData($this->getName()."::badPasswordTime", $time);
-					$userDao->updateObject($user);
+					// update the count to represent this failed attempt
+					$badpwFailedLoginsDao->incCount($user);
 					// warn the user if count has been exceeded
 					if ($count >= $this->getSetting(CONTEXT_SITE, 'betterPasswordLockTries')) {
 						$templateMgr->assign('error', 'plugins.generic.betterPassword.validation.betterPasswordLocked');
@@ -261,11 +330,11 @@ class betterPasswordPlugin extends GenericPlugin {
 		if ($args[0] === "login" && $args[1] === "signIn") {
 			// Hijack the user's signin attempt, if frequent bad passwords are being tried
 			if (isset($_POST['username'])) {
-				$userDao = DAORegistry::getDAO('UserDAO');
-				$user = $userDao->getByUsername($_POST['username']);
+				$badpwFailedLoginsDao = DAORegistry::getDAO('BadpwFailedLoginsDAO');
+				$user = $badpwFailedLoginsDao->getByUsername($_POST['username']);
 				if (isset($user)) {
-					$count = $user->getData($this->getName()."::badPasswordCount");
-					$time = $user->getData($this->getName()."::badPasswordTime");
+					$count = $user->getCount();
+					$time = $user->getFailedTime();
 					if ($count >= $this->getSetting(CONTEXT_SITE, 'betterPasswordLockTries') && $time > time() - $this->getSetting(CONTEXT_SITE, 'betterPasswordLockSeconds')) {
 						// Hijack the typical login/signIn handler to prevent login
 						define('HANDLER_CLASS', 'BetterPasswordHandler');
@@ -287,6 +356,16 @@ class betterPasswordPlugin extends GenericPlugin {
 					$user->setData($this->getName()."::badPasswordTime", 0);
 					$userDao->updateObject($user);
 			}
+		} elseif($hookName === "LoadComponentHandler" && $args[1] === "uploadBlacklists") {
+			define('HANDLER_CLASS', 'BetterPasswordComponentHandler');
+			$args[0] = "plugins.generic.betterPassword.BetterPasswordHandler";
+			$c = import($args[0]);
+			return true;
+		} elseif($hookName === "LoadComponentHandler" && $args[1] === "deleteBlacklists") {
+			define('HANDLER_CLASS', 'BetterPasswordComponentHandler');
+			$args[0] = "plugins.generic.betterPassword.BetterPasswordHandler";
+			$c = import($args[0]);
+			return true;
 		}
 		return false;
 	}
@@ -302,6 +381,48 @@ class betterPasswordPlugin extends GenericPlugin {
 			$this->getName()."::badPasswordTime",
 			)
 		);
+		return false;
+	}
+	
+	/**
+	 * @copydoc PKPPlugin::getInstallSchemaFile()
+	 */
+	public function getInstallSchemaFile() {
+		return $this->getPluginPath() . DIRECTORY_SEPARATOR . 'xml' . DIRECTORY_SEPARATOR . 'schema.xml';
+	}
+	
+	/**
+	 * Register this plugin's DAO with the application
+	 */
+	public function registerDAOs() {
+		$this->import('classes.BadpwFailedLoginsDAO');
+		
+		$badpwFailedLoginDAO = new BadpwFailedLoginsDAO();
+		DAORegistry::registerDAO('BadpwFailedLoginsDAO', $badpwFailedLoginDAO);
+	}
+
+  	/**
+	 * Callback to fill cache with data, if empty.
+	 * @param $cache GenericCache
+	 * @param $passwordHash string The hash of the user password
+	 * @return boolean if hash of the password exists in the cache
+	 */
+	function _PasswordCacheMiss($cache, $passwordHash) {
+		$check = get_class($cache->cacheMiss);
+		if ($check === 'generic_cache_miss') {
+			$cache_password = array();
+			$Passwords = fopen($this->getTempFile(), "r");
+			while (!feof($Passwords)) {
+				$curr_password = rtrim(fgets($Passwords), PHP_EOL);
+				$sha_curr_password = sha1($curr_password);
+				if (strcmp(substr($sha_curr_password,0,2), substr($passwordHash,0,2)) == 0) {
+					$cache_password[$sha_curr_password] = $sha_curr_password;
+				}
+			}
+			fclose($Passwords);
+			$cache->setEntireCache($cache_password);
+			return in_array($passwordHash, $cache_password);
+		}
 		return false;
 	}
 }
